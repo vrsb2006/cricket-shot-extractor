@@ -156,10 +156,26 @@
   </div>
 </main>
 
-<script type="module">
+<script>
 // ── FFmpeg single-thread (no SharedArrayBuffer required) ──────────────────
-import { FFmpeg } from 'https://unpkg.com/@ffmpeg/ffmpeg@0.12.6/dist/esm/index.js';
-import { fetchFile, toBlobURL } from 'https://unpkg.com/@ffmpeg/util@0.12.1/dist/esm/index.js';
+// ── We do NOT import FFmpeg as an ES module because unpkg blocks
+//    cross-origin Worker construction. Instead we fetch worker.js,
+//    wrap it in a Blob URL, and create FFmpeg from the UMD build.
+// ── fetchFile helper (lightweight, inline) ────────────────────────────────
+async function fetchFile(file) {
+  if (file instanceof File || file instanceof Blob) {
+    return new Uint8Array(await file.arrayBuffer());
+  }
+  const res = await fetch(file);
+  return new Uint8Array(await res.arrayBuffer());
+}
+
+async function toBlobURL(url, mimeType) {
+  const res  = await fetch(url);
+  const text = await res.text();
+  const blob = new Blob([text], { type: mimeType });
+  return URL.createObjectURL(blob);
+}
 
 const statusEl = document.getElementById('ffmpeg-status');
 let ffmpegReady = false;
@@ -167,36 +183,53 @@ let ffmpeg;
 
 async function loadFFmpeg() {
   try {
+    statusEl.textContent = '⏳ Fetching FFmpeg worker…';
+
+    // Convert all remote scripts to blob: URLs so same-origin Worker rules pass
+    const FFMPEG_BASE  = 'https://unpkg.com/@ffmpeg/ffmpeg@0.12.6/dist/umd';
+    const CORE_BASE    = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
+
+    // 1. Load the UMD bundle into this page (defines window.FFmpegWASM)
+    await new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = `${FFMPEG_BASE}/ffmpeg.js`;
+      s.onload = resolve;
+      s.onerror = () => reject(new Error('Failed to load ffmpeg.js UMD bundle'));
+      document.head.appendChild(s);
+    });
+
+    statusEl.textContent = '⏳ Fetching FFmpeg core (~10 MB)…';
+
+    // 2. Blob-ify the worker + core so cross-origin restrictions don't apply
+    const [workerURL, coreURL, wasmURL] = await Promise.all([
+      toBlobURL(`${FFMPEG_BASE}/worker.js`,    'text/javascript'),
+      toBlobURL(`${CORE_BASE}/ffmpeg-core.js`, 'text/javascript'),
+      toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, 'application/wasm'),
+    ]);
+
+    statusEl.textContent = '⏳ Initialising WASM…';
+
+    const { FFmpeg } = window.FFmpegWASM;
     ffmpeg = new FFmpeg();
+
     ffmpeg.on('log', ({ message }) => {
-      // only show non-spam logs
       if (!message.startsWith('frame=') && !message.startsWith('size=')) {
         appendLog(message, '');
       }
     });
     ffmpeg.on('progress', ({ progress }) => {
       if (progress >= 0 && progress <= 1) {
-        setProgress(75 + Math.round(progress * 20), `Encoding… ${Math.round(progress*100)}%`);
+        setProgress(75 + Math.round(progress * 20), `Encoding… ${Math.round(progress * 100)}%`);
       }
     });
 
-    // Single-thread core — no COOP/COEP headers needed
-    const base = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
-    statusEl.textContent = '⏳ Fetching FFmpeg core…';
-
-    const [coreURL, wasmURL] = await Promise.all([
-      toBlobURL(`${base}/ffmpeg-core.js`,   'text/javascript'),
-      toBlobURL(`${base}/ffmpeg-core.wasm`, 'application/wasm'),
-    ]);
-
-    statusEl.textContent = '⏳ Initialising WASM…';
-    await ffmpeg.load({ coreURL, wasmURL });
+    await ffmpeg.load({ workerLoadURL: workerURL, coreURL, wasmURL });
 
     ffmpegReady = true;
     statusEl.textContent = '✓ FFmpeg ready — all processing is local on your device';
     statusEl.className = 'ready';
   } catch(e) {
-    statusEl.textContent = `✗ FFmpeg failed: ${e.message}. Try Chrome/Edge on Android, or check your internet connection.`;
+    statusEl.textContent = `✗ FFmpeg failed: ${e.message}`;
     statusEl.className = 'error';
     appendLog('FFmpeg load error: ' + e.message, 'err');
   }
